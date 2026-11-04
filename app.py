@@ -3,8 +3,9 @@ import json, subprocess, sys, time
 import streamlit as st
 import torch
 import torch.nn as nn
-from torchvision import models, transforms
+from torchvision import models
 from PIL import Image
+from model_utils import build_eval_transform
 import pandas as pd
 import plotly.express as px
 
@@ -29,7 +30,7 @@ section[data-testid="stSidebar"] {background:#10182a;}
 
 @st.cache_resource
 def load_model(path_str, mtime):
-    checkpoint = torch.load(path_str, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(path_str, map_location="cpu", weights_only=True)
     img_size = checkpoint.get("img_size", 224)
     model = models.efficientnet_b0(weights=None)
     model.classifier[1] = nn.Linear(model.classifier[1].in_features, len(checkpoint["classes"]))
@@ -53,11 +54,8 @@ def benchmark_inference(path_str, mtime):
 
 
 def image_transform(img_size=224):
-    return transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
+    # Та же предобработка, что использовалась на validation/test.
+    return build_eval_transform(img_size)
 
 
 def read_progress():
@@ -79,22 +77,26 @@ def log_tail(n=25):
 def split_counts(split):
     d = ROOT / "dataset" / split
     out = {}
+    extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
     if d.exists():
-        for c in sorted(p.name for p in d.iterdir() if p.is_dir()):
-            out[c] = sum(1 for e in ("*.jpg", "*.jpeg", "*.png") for _ in (d / c).glob(e))
+        for class_dir in sorted(p for p in d.iterdir() if p.is_dir()):
+            out[class_dir.name] = sum(
+                1 for file_path in class_dir.rglob("*")
+                if file_path.is_file() and file_path.suffix.lower() in extensions
+            )
     return out
 
 
-st.markdown('<div class="hero"><h1>🌌 AstroVision AI</h1><p class="muted">Интеллектуальный анализ астрофотографий · Галактики и туманности · v0.3</p></div>', unsafe_allow_html=True)
+st.markdown('<div class="hero"><h1>🌌 AstroVision AI</h1><p class="muted">Исследовательская система классификации астрофотографий · Галактики и туманности · v0.5</p></div>', unsafe_allow_html=True)
 st.write("")
 page = st.sidebar.radio("Навигация", ["Анализ снимка", "Обучение модели", "Научная статистика", "О проекте"])
-st.sidebar.caption("Исследовательский прототип • версия 0.2")
+st.sidebar.caption("Исследовательский прототип • версия 0.5")
 
 # =====================================================================
 if page == "Анализ снимка":
     st.subheader("Анализ астрофотографии")
-    st.write("Загрузите изображение в формате JPG, JPEG или PNG. Модель выдаст класс и оценку уверенности.")
-    tta = st.checkbox("TTA: усреднение с отражённым снимком (точнее, чуть медленнее)", value=False)
+    st.write("Загрузите астрофотографию. Модель сравнит её с двумя изученными классами: галактики и туманности.")
+    tta = st.checkbox("TTA: усреднение вероятностей с отражённым снимком (медленнее)", value=False)
     uploaded = st.file_uploader("Выберите астрофотографию", type=["jpg", "jpeg", "png"])
     if not MODEL_PATH.exists():
         st.info("Модель ещё не обучена. Загрузите датасет и запустите обучение на странице «Обучение модели» или выполните:")
@@ -111,7 +113,7 @@ if page == "Анализ снимка":
             with torch.no_grad():
                 if tta:
                     x2 = torch.flip(x, dims=[3])
-                    probs = torch.softmax((model(x) + model(x2)) / 2, dim=1)[0]
+                    probs = (torch.softmax(model(x), dim=1) + torch.softmax(model(x2), dim=1))[0] / 2
                 else:
                     probs = torch.softmax(model(x), dim=1)[0]
             infer_ms = (time.perf_counter() - t0) * 1000
@@ -120,7 +122,7 @@ if page == "Анализ снимка":
             confidence = values[idx]
             with right:
                 if confidence < threshold:
-                    st.warning("Неизвестный объект / низкая уверенность")
+                    st.warning("Низкая уверенность: результат требует ручной проверки. Это не полноценное обнаружение неизвестных классов.")
                 else:
                     st.success(f"Предсказание: **{DISPLAY.get(classes[idx], classes[idx])}**")
                 st.metric("Уверенность модели", f"{confidence*100:.1f}%")
@@ -194,9 +196,27 @@ elif page == "Обучение модели":
                     st.write(f"`{split}`: " + ", ".join(f"{k} — {v}" for k, v in counts.items()))
                 else:
                     st.write(f"`{split}`: — папка не заполнена")
-            ok = bool(split_counts("train")) and bool(split_counts("val"))
+            counts_train, counts_val, counts_test = split_counts("train"), split_counts("val"), split_counts("test")
+            ok = (set(counts_train) == {"galaxies", "nebulae"} and
+                  set(counts_val) == {"galaxies", "nebulae"} and
+                  set(counts_test) == {"galaxies", "nebulae"} and
+                  all(counts_train.values()) and all(counts_val.values()) and all(counts_test.values()))
             if not ok:
-                st.warning("Нужны непустые папки dataset/train и dataset/val. См. README.md.")
+                st.warning("Для исследовательского обучения нужны оба класса в dataset/train, dataset/val и dataset/test. См. README.md.")
+            if st.button("🔎 Проверить датасет для конференции", disabled=not ok):
+                audit_cmd = [sys.executable, str(ROOT / "audit_dataset.py"),
+                             "--data_dir", str(ROOT / "dataset"),
+                             "--require_metadata", "--require_provenance",
+                             "--out", str(ROOT / "reports" / "dataset_audit.json")]
+                audit = subprocess.run(audit_cmd, cwd=ROOT, capture_output=True, text=True)
+                st.session_state["audit_passed"] = audit.returncode == 0
+                st.session_state["audit_output"] = (audit.stdout or "") + (audit.stderr or "")
+            if st.session_state.get("audit_output"):
+                if st.session_state.get("audit_passed"):
+                    st.success("Аудит пройден. Датасет прошёл проверки структуры, дубликатов, object_id и provenance.")
+                else:
+                    st.error("Аудит не пройден. Исправьте перечисленные ошибки.")
+                st.code(st.session_state["audit_output"], language=None)
         with c2:
             st.markdown("**Вычислительное устройство**")
             if device.type == "cuda":
@@ -207,31 +227,47 @@ elif page == "Обучение модели":
 
         st.markdown("**Гиперпараметры**")
         c1, c2, c3 = st.columns(3)
-        epochs = c1.slider("Эпохи", 2, 50, 8)
+        epochs = c1.slider("Эпохи", 2, 60, 15)
         batch_size = c2.select_slider("Batch size", options=[4, 8, 16, 32], value=16)
         lr = c3.select_slider("Learning rate", options=[1e-5, 3e-5, 1e-4, 3e-4], value=1e-4, format_func=lambda v: f"{v:.0e}")
         c1, c2, c3 = st.columns(3)
         freeze_epochs = c1.slider("Эпох с замороженным backbone", 0, 5, 2)
         patience = c2.slider("Ранняя остановка (эпох без улучшения)", 0, 10, 4)
-        threshold = c3.slider("Порог «неизвестный объект»", 0.3, 0.95, 0.65, 0.05)
+        threshold = c3.slider("Порог предупреждения о низкой уверенности", 0.3, 0.95, 0.65, 0.05)
         with st.expander("Дополнительно"):
             c1, c2, c3 = st.columns(3)
             use_amp = c1.checkbox("AMP (ускорение)", value=True)
             use_aug = c2.checkbox("Расширенные аугментации", value=True)
             workers = c3.number_input("Workers (0 — безопаснее на Windows)", 0, 8, 0)
             img_size = c1.select_slider("Размер изображения", options=[160, 224, 256], value=224)
+            seed = c2.number_input("Seed (для воспроизводимости)", min_value=0, max_value=999999, value=42, step=1)
+            weighted_loss = c3.checkbox("Взвешивать классы при дисбалансе", value=False)
 
         if st.button("🚀 Запустить обучение", type="primary", disabled=not ok):
+            audit_cmd = [sys.executable, str(ROOT / "audit_dataset.py"),
+                         "--data_dir", str(ROOT / "dataset"),
+                         "--require_metadata", "--require_provenance",
+                         "--out", str(ROOT / "reports" / "dataset_audit.json")]
+            audit = subprocess.run(audit_cmd, cwd=ROOT, capture_output=True, text=True)
+            st.session_state["audit_passed"] = audit.returncode == 0
+            st.session_state["audit_output"] = (audit.stdout or "") + (audit.stderr or "")
+            if audit.returncode != 0:
+                st.error("Обучение не запущено: датасет не прошёл аудит.")
+                st.code(st.session_state["audit_output"], language=None)
+                st.stop()
             cmd = [sys.executable, str(ROOT / "train.py"), "--data_dir", str(ROOT / "dataset"),
                    "--epochs", str(epochs), "--batch_size", str(batch_size), "--lr", str(lr),
                    "--threshold", str(threshold), "--freeze_epochs", str(freeze_epochs),
                    "--patience", str(patience), "--workers", str(workers),
-                   "--img_size", str(img_size), "--progress_file", str(PROGRESS_PATH),
-                   "--stop_file", str(STOP_FLAG), "--out", str(MODEL_PATH)]
+                   "--img_size", str(img_size), "--seed", str(seed), "--progress_file", str(PROGRESS_PATH),
+                   "--stop_file", str(STOP_FLAG), "--out", str(MODEL_PATH),
+                   "--require_metadata", "--require_provenance"]
             if not use_amp:
                 cmd.append("--no_amp")
             if not use_aug:
                 cmd.append("--no_aug")
+            if weighted_loss:
+                cmd.append("--class_weighted_loss")
             PROGRESS_PATH.unlink(missing_ok=True)
             LOG_PATH.write_text("", encoding="utf-8")
             STOP_FLAG.unlink(missing_ok=True)
@@ -253,7 +289,7 @@ elif page == "Научная статистика":
         ms = benchmark_inference(str(MODEL_PATH), MODEL_PATH.stat().st_mtime)
         c0, c1, c2, c3 = st.columns(4)
         c0.metric("Скорость инференса", f"{ms:.0f} мс")
-        c1.metric("Производительность", f"{1000/ms:.1f} изобр/с")
+        c1.metric("Производительность", f"{1000/max(ms, 1e-6):.1f} изобр/с")
         c2.metric("Размер входа", f"{img_size}×{img_size}")
         c3.metric("Устройство теста", "CPU")
         st.caption("Бенчмарк: одиночные изображения на CPU. На GPU инференс обычно в разы быстрее.")
@@ -265,9 +301,26 @@ elif page == "Научная статистика":
             st.plotly_chart(fig, use_container_width=True)
         if metrics:
             cols = st.columns(4)
-            for col, key, label in zip(cols, ["accuracy", "precision_macro", "recall_macro", "f1_macro"],
-                                       ["Accuracy", "Precision (macro)", "Recall (macro)", "F1-score (macro)"]):
-                col.metric(label, f"{metrics.get(key, 0):.3f}")
+            for col, key, label in zip(cols, ["accuracy", "balanced_accuracy", "f1_macro", "roc_auc"],
+                                       ["Accuracy", "Balanced accuracy", "F1-score (macro)", "ROC-AUC"]):
+                value = metrics.get(key)
+                col.metric(label, f"{value:.3f}" if value is not None else "—")
+            extra_cols = st.columns(3)
+            for col, key, label in zip(extra_cols, ["matthews_corrcoef", "cohen_kappa", "ece_15_bins"],
+                                       ["MCC", "Cohen’s kappa", "ECE (15 bins)"]):
+                value = metrics.get(key)
+                col.metric(label, f"{value:.3f}" if value is not None else "—")
+            ci = metrics.get("bootstrap_95ci", {})
+            if ci:
+                st.markdown("**95% доверительные интервалы (bootstrap на тестовой выборке)**")
+                ci_rows = [{"Метрика": key, "Нижняя граница": bounds[0], "Верхняя граница": bounds[1]}
+                           for key, bounds in ci.items()
+                           if isinstance(bounds, list) and len(bounds) == 2]
+                if ci_rows:
+                    st.dataframe(pd.DataFrame(ci_rows), use_container_width=True, hide_index=True)
+                unit = ci.get("bootstrap_unit", "unknown")
+                count = ci.get("n_bootstrap", "—")
+                st.caption(f"Единица выборки: {unit}; повторов: {count}.")
             cm = metrics.get("confusion_matrix")
             if cm:
                 import plotly.figure_factory as ff
@@ -281,30 +334,39 @@ elif page == "Научная статистика":
                 st.dataframe(pd.DataFrame(pc).T, use_container_width=True)
         else:
             st.warning("Тестовые метрики отсутствуют. Проверьте структуру test/ и повторите обучение.")
-        st.caption(f"Порог для ответа «неизвестный объект»: {threshold:.2f}")
+        st.caption(f"Порог предупреждения о низкой уверенности: {threshold:.2f}. Это эвристика, не OOD-детектор.")
 
 # =====================================================================
 else:
     st.subheader("О проекте")
     st.markdown("""
-**AstroVision AI v0.3** — учебно-исследовательский прототип компьютерного зрения для классификации астрофотографий на два класса: галактики и туманности.
+**AstroVision AI v0.5** — учебно-исследовательский прототип компьютерного зрения для классификации астрофотографий на два класса: галактики и туманности.
 
 **Метод:** transfer learning на EfficientNet-B0 (ImageNet) с двухэтапным дообучением: сначала замороженный backbone и обучаемый классификатор, затем разморозка с малым learning rate.
 
-**Скорость (v0.3):**
+**Воспроизводимость и оценка (v0.5):**
+- фиксируемый seed и одинаковые настройки для повторных запусков;
+- проверка точных дубликатов между train/val/test и группировки по object_id;
+- единая letterbox-предобработка без искажения пропорций для train/validation/test/inference;
+- проверка происхождения и лицензий изображений перед запуском из интерфейса;
+- обязательный независимый test-набор для исследовательского обучения;
+- Accuracy, Balanced Accuracy, Precision, Recall, F1, ROC-AUC, MCC, Cohen’s kappa;
+- 95% bootstrap-интервалы и CSV с предсказаниями на каждом тестовом изображении.
+
+**Скорость:**
 - Mixed precision (AMP): float16 на GPU, bfloat16 на CPU;
 - `channels_last`, `pin_memory`, `non_blocking`, `cudnn.benchmark`;
-- косинусное расписание learning rate с прогревом;
+- косинусное расписание learning rate с ненулевым шагом при размораживании backbone;
 - замер скорости обучения (изображений/с) и бенчмарк инференса;
 - опциональный TTA (test-time augmentation) — усреднение предсказаний с отражённым снимком.
 
-**Обучение (v0.3):**
+**Обучение:**
 - запуск обучения прямо из веб-интерфейса с живым прогрессом и графиком потерь;
 - мягкая остановка после текущей эпохи; ранняя остановка по val_loss;
-- расширенные аугментации (повороты, отражения, кропы, цветовые сдвиги, размытие);
+- умеренные аугментации (повороты, отражения, кропы и небольшие цветовые сдвиги);
 - per-class метрики и история обучения в чекпоинте.
 
-**Ограничения:** модель не определяет название конкретного небесного объекта, координаты или физические свойства. Она классифицирует изображение по двум заданным классам. Значение softmax — оценка модели, не автоматически откалиброванная вероятность истинности; порог «неизвестный объект» подбирается на validation set.
+**Ограничения:** модель не определяет название конкретного небесного объекта, координаты или физические свойства. Она классифицирует изображение только на два заданных класса. Значение softmax — оценка модели, а не гарантированная вероятность истинности. Низкая уверенность не является полноценным OOD-детектором. Доверительные интервалы не компенсируют маленький или нерепрезентативный test-набор.
 
 **Технологии:** Python, PyTorch, torchvision, Streamlit, Plotly, scikit-learn.
 

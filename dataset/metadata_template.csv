@@ -1,0 +1,3 @@
+path,object_id,source,license
+train/galaxies/example_galaxy_01.jpg,NGC_example_001,https://example.org/dataset,CC-BY-4.0
+train/nebulae/example_nebula_01.jpg,Messier_example_001,https://example.org/dataset,CC-BY-4.0
