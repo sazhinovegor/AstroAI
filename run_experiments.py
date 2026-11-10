@@ -19,6 +19,8 @@ METRICS = ["accuracy", "balanced_accuracy", "precision_macro", "recall_macro",
 def main():
     parser = argparse.ArgumentParser(description="Повторные эксперименты AstroVision AI")
     parser.add_argument("--data_dir", default="dataset")
+    parser.add_argument("--architectures", nargs="+", choices=["efficientnet_b0", "resnet50", "convnext_tiny"],
+                        default=["efficientnet_b0", "resnet50", "convnext_tiny"])
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -31,7 +33,7 @@ def main():
     parser.add_argument("--no_aug", action="store_true")
     parser.add_argument("--class_weighted_loss", action="store_true")
     parser.add_argument("--from_scratch", action="store_true",
-                        help="Сравнить обучение EfficientNet-B0 без предобученных весов")
+                        help="Сравнить выбранные архитектуры без предобученных весов")
     parser.add_argument("--require_metadata", action="store_true")
     parser.add_argument("--require_provenance", action="store_true")
     args = parser.parse_args()
@@ -41,8 +43,9 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     records = []
-    for seed in args.seeds:
-        run_dir = out_dir / f"seed_{seed}"
+    for arch in args.architectures:
+      for seed in args.seeds:
+        run_dir = out_dir / arch / f"seed_{seed}"
         run_dir.mkdir(parents=True, exist_ok=True)
         model_path = run_dir / "astrovision_model.pth"
         command = [
@@ -50,7 +53,7 @@ def main():
             "--epochs", str(args.epochs), "--batch_size", str(args.batch_size),
             "--lr", str(args.lr), "--img_size", str(args.img_size),
             "--freeze_epochs", str(args.freeze_epochs), "--patience", str(args.patience),
-            "--seed", str(seed), "--out", str(model_path),
+            "--seed", str(seed), "--arch", arch, "--out", str(model_path),
         ]
         if args.no_amp:
             command.append("--no_amp")
@@ -74,28 +77,30 @@ def main():
             raise SystemExit(result.returncode)
         metrics_path = model_path.with_suffix("").with_suffix(".metrics.json")
         metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-        row = {"seed": seed, **{key: metrics.get(key) for key in METRICS}}
+        row = {"architecture": arch, "seed": seed, **{key: metrics.get(key) for key in METRICS}}
         records.append(row)
-        print(f"seed={seed}: accuracy={metrics['accuracy']:.4f}, f1_macro={metrics['f1_macro']:.4f}")
+        print(f"arch={arch}, seed={seed}: accuracy={metrics['accuracy']:.4f}, f1_macro={metrics['f1_macro']:.4f}")
 
     summary_path = out_dir / "repeated_experiments.csv"
     with summary_path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=["seed", *METRICS])
+        writer = csv.DictWriter(f, fieldnames=["architecture", "seed", *METRICS])
         writer.writeheader()
         writer.writerows(records)
 
     aggregate = {}
-    for metric in METRICS:
-        values = [float(r[metric]) for r in records if r.get(metric) is not None]
-        if values:
-            aggregate[metric] = {
-                "mean": sum(values) / len(values),
-                "std": (sum((x - sum(values) / len(values)) ** 2 for x in values) / (len(values) - 1)) ** 0.5
-                        if len(values) > 1 else 0.0,
-                "runs": len(values),
-            }
-    summary = {"seeds": args.seeds, "runs": records, "mean_and_std": aggregate,
-               "note": "Разброс между seed отражает вариативность обучения при фиксированном train/val/test."}
+    for arch in args.architectures:
+        aggregate[arch] = {}
+        arch_records = [r for r in records if r["architecture"] == arch]
+        for metric in METRICS:
+            values = [float(r[metric]) for r in arch_records if r.get(metric) is not None]
+            if values:
+                mean = sum(values) / len(values)
+                aggregate[arch][metric] = {
+                    "mean": mean,
+                    "std": (sum((x - mean) ** 2 for x in values) / (len(values) - 1)) ** 0.5
+                            if len(values) > 1 else 0.0,
+                    "runs": len(values),
+                }
     (out_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nСводка сохранена: {summary_path} и {out_dir / 'summary.json'}")
     print(json.dumps(aggregate, ensure_ascii=False, indent=2))

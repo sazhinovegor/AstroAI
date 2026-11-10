@@ -6,6 +6,7 @@ import torch.nn as nn
 from torchvision import models
 from PIL import Image, ImageOps
 from model_utils import build_eval_transform
+from model_factory import build_model, ARCHITECTURES
 from explainability import make_gradcam
 from inference_utils import predict_many, predict_image
 import pandas as pd
@@ -34,8 +35,8 @@ section[data-testid="stSidebar"] {background:#10182a;}
 def load_model(path_str, mtime):
     checkpoint = torch.load(path_str, map_location="cpu", weights_only=True)
     img_size = checkpoint.get("img_size", 224)
-    model = models.efficientnet_b0(weights=None)
-    model.classifier[1] = nn.Linear(model.classifier[1].in_features, len(checkpoint["classes"]))
+    arch = checkpoint.get("arch", "efficientnet_b0")
+    model = build_model(arch, len(checkpoint["classes"]), pretrained=False)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return model, checkpoint["classes"], checkpoint.get("threshold", 0.65),         checkpoint.get("metrics", {}), checkpoint.get("history", []), img_size
@@ -89,7 +90,7 @@ def split_counts(split):
     return out
 
 
-st.markdown('<div class="hero"><h1>🌌 AstroVision AI</h1><p class="muted">Исследовательская система классификации астрофотографий · Только галактики и туманности · open-set фильтрация · v1.0</p></div>', unsafe_allow_html=True)
+st.markdown('<div class="hero"><h1>🌌 AstroVision AI</h1><p class="muted">Исследовательская система классификации астрофотографий · Только галактики и туманности · open-set фильтрация · v2.0</p></div>', unsafe_allow_html=True)
 st.write("")
 page = st.sidebar.radio("Навигация", ["Анализ снимка", "Пакетный анализ", "Обучение модели", "Научная статистика", "О проекте"])
 st.sidebar.caption("Исследовательский прототип • версия 1.0")
@@ -281,6 +282,8 @@ elif page == "Обучение модели":
         epochs = c1.slider("Эпохи", 2, 60, 15)
         batch_size = c2.select_slider("Batch size", options=[4, 8, 16, 32], value=16)
         lr = c3.select_slider("Learning rate", options=[1e-5, 3e-5, 1e-4, 3e-4], value=1e-4, format_func=lambda v: f"{v:.0e}")
+        architecture = st.selectbox("Архитектура нейросети", options=list(ARCHITECTURES),
+                                    format_func=lambda x: {"efficientnet_b0": "EfficientNet-B0", "resnet50": "ResNet50", "convnext_tiny": "ConvNeXt-Tiny"}[x])
         c1, c2, c3 = st.columns(3)
         freeze_epochs = c1.slider("Эпох с замороженным backbone", 0, 5, 2)
         patience = c2.slider("Ранняя остановка (эпох без улучшения)", 0, 10, 4)
@@ -308,7 +311,7 @@ elif page == "Обучение модели":
                 st.stop()
             cmd = [sys.executable, str(ROOT / "train.py"), "--data_dir", str(ROOT / "dataset"),
                    "--epochs", str(epochs), "--batch_size", str(batch_size), "--lr", str(lr),
-                   "--threshold", str(threshold), "--freeze_epochs", str(freeze_epochs),
+                   "--threshold", str(threshold), "--arch", architecture, "--freeze_epochs", str(freeze_epochs),
                    "--patience", str(patience), "--workers", str(workers),
                    "--img_size", str(img_size), "--seed", str(seed), "--progress_file", str(PROGRESS_PATH),
                    "--stop_file", str(STOP_FLAG), "--out", str(MODEL_PATH),
@@ -391,11 +394,11 @@ elif page == "Научная статистика":
 else:
     st.subheader("О проекте")
     st.markdown("""
-**AstroVision AI v1.0** — учебно-исследовательская система, которая принимает только галактики и туманности. Внутренний класс `other` нужен для отказа от всех неподходящих изображений.
+**AstroVision AI v2.0** — учебно-исследовательская система, которая принимает только галактики и туманности. Внутренний класс `other` нужен для отказа от всех неподходящих изображений.
 
-**Метод:** transfer learning на EfficientNet-B0 (ImageNet), три обучаемых класса (`galaxies`, `nebulae`, `other`) и отказ от низкоуверенных результатов. Двухэтапное дообучение: сначала замороженный backbone и обучаемый классификатор, затем разморозка с малым learning rate.
+**Метод:** сравнительное обучение EfficientNet-B0, ResNet50 и ConvNeXt-Tiny (ImageNet), три обучаемых класса (`galaxies`, `nebulae`, `other`) и отказ от низкоуверенных результатов. Двухэтапное дообучение: сначала замороженный backbone и обучаемый классификатор, затем разморозка с малым learning rate.
 
-**Воспроизводимость и оценка (v0.6):**
+**Воспроизводимость и оценка (v2.0):**
 - фиксируемый seed и одинаковые настройки для повторных запусков;
 - проверка точных дубликатов между train/val/test и группировки по object_id;
 - единая letterbox-предобработка без искажения пропорций для train/validation/test/inference;
@@ -405,6 +408,7 @@ else:
 - 95% bootstrap-интервалы и CSV с предсказаниями на каждом тестовом изображении.
 
 **Инструменты анализа:**
+- три архитектуры доступны через CLI `train.py --arch`; checkpoint хранит архитектуру и загружается автоматически;
 - пакетная классификация до 100 снимков с CSV-отчётом и изоляцией ошибок отдельных файлов;
 - Grad-CAM для визуальной проверки областей изображения, влияющих на решение модели;
 - классический baseline на цветовых гистограммах, миниатюре яркости и логистической регрессии;

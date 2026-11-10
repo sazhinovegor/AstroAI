@@ -118,3 +118,16 @@ def test_predict_image_rejects_other_class():
     assert result.predicted_class == "other"
     assert result.status == "not_supported"
     assert "не относится" in result.rejection_reason
+
+
+def test_model_factory_builds_all_research_architectures():
+    import torch
+    from model_factory import ARCHITECTURES, build_model, classifier_parameters
+
+    for arch in ARCHITECTURES:
+        model = build_model(arch, num_classes=3, pretrained=False)
+        model.eval()
+        with torch.inference_mode():
+            output = model(torch.zeros(1, 3, 96, 96))
+        assert output.shape == (1, 3)
+        assert classifier_parameters(model, arch)

@@ -1,6 +1,6 @@
-"""AstroVision AI v0.6 — воспроизводимое обучение классификатора астрофотографий.
+"""AstroVision AI v2.0 — воспроизводимое сравнительное обучение классификаторов астрофотографий.
 
-Классы: galaxies и nebulae. Модель: EfficientNet-B0 + transfer learning.
+Классы: galaxies, nebulae и other. Архитектуры: EfficientNet-B0, ResNet50, ConvNeXt-Tiny.
 Важные принципы: фиксированный seed, контроль утечек данных, best checkpoint
 по validation loss и итоговая оценка только на отдельном test-наборе.
 """
@@ -37,6 +37,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, models, transforms
 
 from model_utils import SquarePadResize, build_eval_transform, MEAN, STD
+from model_factory import ARCHITECTURES, build_model, classifier_parameters
 
 EXPECTED_CLASSES = ["galaxies", "nebulae", "other"]
 
@@ -417,8 +418,10 @@ def evaluate_test(model, loader, classes, device, use_amp, out_prefix: Path, see
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AstroVision AI v0.6 research training")
+    parser = argparse.ArgumentParser(description="AstroVision AI v2.0 research training")
     parser.add_argument("--data_dir", default="dataset")
+    parser.add_argument("--arch", choices=ARCHITECTURES, default="efficientnet_b0",
+                        help="Архитектура для сравнительного исследования")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -434,7 +437,7 @@ def main():
     parser.add_argument("--class_weighted_loss", action="store_true",
                          help="Компенсировать дисбаланс классов весами loss")
     parser.add_argument("--from_scratch", action="store_true",
-                         help="Инициализировать EfficientNet-B0 случайно, без весов ImageNet (контрольный эксперимент)")
+                         help="Инициализировать backbone случайно, без весов ImageNet (контрольный эксперимент)")
     parser.add_argument("--require_metadata", action="store_true",
                          help="Остановиться, если metadata.csv не содержит object_id для всех снимков")
     parser.add_argument("--require_provenance", action="store_true",
@@ -518,9 +521,7 @@ def main():
 
     if args.from_scratch and args.freeze_epochs > 0:
         raise SystemExit("Для --from_scratch используйте --freeze_epochs 0: случайно инициализированную backbone нельзя замораживать.")
-    weights = None if args.from_scratch else models.EfficientNet_B0_Weights.DEFAULT
-    model = models.efficientnet_b0(weights=weights)
-    model.classifier[1] = nn.Linear(model.classifier[1].in_features, len(train_ds.classes))
+    model = build_model(args.arch, len(train_ds.classes), pretrained=not args.from_scratch)
     model.to(device)
     if channels_last:
         model.to(memory_format=torch.channels_last)
@@ -534,7 +535,7 @@ def main():
                                      dtype=torch.float32, device=device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    head_params = list(model.classifier.parameters())
+    head_params = classifier_parameters(model, args.arch)
     head_ids = {id(param) for param in head_params}
     backbone_params = [param for param in model.parameters() if id(param) not in head_ids]
     for param in backbone_params:
@@ -660,7 +661,7 @@ def main():
             "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
         },
         "classes": train_ds.classes,
-        "architecture": "EfficientNet-B0",
+        "architecture": args.arch,
         "pretrained_imagenet": not args.from_scratch,
         "best_val_loss": best_val_loss,
         "metrics": metrics,
@@ -677,7 +678,7 @@ def main():
         "metrics": metrics,
         "history": history,
         "img_size": args.img_size,
-        "arch": "efficientnet_b0",
+        "arch": args.arch,
         "pretrained_imagenet": not args.from_scratch,
         "seed": args.seed,
         "best_val_loss": best_val_loss,

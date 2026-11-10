@@ -1,4 +1,4 @@
-# AstroVision AI — v1.0 (Open-set Research Edition)
+# AstroVision AI — v2.0 (Research Edition)
 
 Исследовательское приложение Streamlit для распознавания **только двух целевых типов астрофотографий**:
 - `galaxies` — галактики;
@@ -8,7 +8,14 @@
 
 > Важно: это не гарантия распознавания любых неизвестных изображений. Надёжность отказа зависит от разнообразия класса `other`, качества разметки и независимой проверки. Модель нельзя считать обученной, пока не подготовлен датасет и не запущено обучение.
 
-## Крупные изменения v1.0
+## Крупные изменения v2.0
+
+1. **Сравнение архитектур.** EfficientNet-B0, ResNet50 и ConvNeXt-Tiny доступны в обучении. Архитектура сохраняется в checkpoint.
+2. **Grad-CAM для разных backbone.** Визуальное объяснение использует последний свёрточный слой выбранной модели.
+3. **Повторные сравнительные эксперименты.** `run_experiments.py` запускает несколько архитектур и seed, сохраняет CSV и сводку среднего/стандартного отклонения отдельно для каждой архитектуры.
+4. **Пакет материалов конференции.** Методика, гипотеза, метрики, ограничения и сценарий демонстрации находятся в `research/CONFERENCE_PACKAGE.md`.
+
+## Изменения v1.0
 
 1. **Open-set поведение через класс отказа.** Обучение теперь требует три класса: galaxies, nebulae и other.
 2. **Единый инференс-путь.** Одиночная и пакетная классификация используют одну функцию `predict_image`, одинаковую предобработку, EXIF-коррекцию и TTA.
@@ -75,10 +82,27 @@ python prepare_dataset.py --help
 ## 3. Обучение
 
 ```powershell
-python train.py --data_dir dataset --epochs 20 --batch_size 16 --seed 42 --require_metadata --require_provenance
+python train.py --data_dir dataset --arch efficientnet_b0 --epochs 20 --batch_size 16 --seed 42 --require_metadata --require_provenance
 ```
 
 При нехватке VRAM используйте `--batch_size 8` или `4`. Обучение автоматически выберет CUDA, если она доступна.
+
+
+## 3.1 Сравнение архитектур для конференции
+
+Один запуск выбранной архитектуры:
+
+```powershell
+python train.py --data_dir dataset --arch resnet50 --epochs 20 --batch_size 16 --seed 42 --require_metadata --require_provenance
+```
+
+Сравнение трёх архитектур на трёх seed (вычислительно затратный сценарий):
+
+```powershell
+python run_experiments.py --data_dir dataset --architectures efficientnet_b0 resnet50 convnext_tiny --seeds 42 43 44 --epochs 20 --batch_size 16 --require_metadata --require_provenance
+```
+
+Результаты сохраняются в `research_runs/repeated_experiments.csv` и `research_runs/summary.json`. Сравнение имеет смысл только при одном и том же датасете и split.
 
 ## 4. Запуск приложения
 
@@ -109,3 +133,7 @@ python -m compileall -q .
 - результаты отдельно для разных групп `other`.
 
 Не заявляйте абсолютную точность или гарантированное распознавание неизвестных объектов без такого тестирования.
+
+
+## Материалы конференции
+См. `research/CONFERENCE_PACKAGE.md` и `CHANGELOG.md`. Не заполняйте результаты исследования до фактического обучения и тестирования.
