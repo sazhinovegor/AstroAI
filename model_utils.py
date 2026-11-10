@@ -1,6 +1,8 @@
 """Общие преобразования изображений AstroVision AI.
 
-Одна и та же геометрическая предобработка используется при обучении и инференсе.
+Геометрическая предобработка едина для обучения, оценки и инференса.
+EXIF Orientation применяется до изменения размера, чтобы снимки с камер
+и мобильных устройств не попадали в модель повернутыми неверно.
 """
 from __future__ import annotations
 
@@ -21,7 +23,9 @@ class SquarePadResize:
         self.fill = fill
 
     def __call__(self, image: Image.Image) -> Image.Image:
-        image = image.convert("RGB")
+        if not isinstance(image, Image.Image):
+            raise TypeError("Ожидается объект PIL.Image.Image")
+        image = ImageOps.exif_transpose(image).convert("RGB")
         return ImageOps.pad(
             image,
             (self.size, self.size),
@@ -35,7 +39,7 @@ class SquarePadResize:
 
 
 def build_eval_transform(img_size: int = 224):
-    """Детерминированная предобработка для validation, test и пользовательских снимков."""
+    """Детерминированная предобработка для validation, test и инференса."""
     return transforms.Compose([
         SquarePadResize(img_size),
         transforms.ToTensor(),

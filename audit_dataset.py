@@ -12,7 +12,7 @@ from pathlib import Path
 from PIL import Image, UnidentifiedImageError
 
 SPLITS = ("train", "val", "test")
-CLASSES = ("galaxies", "nebulae")
+CLASSES = ("galaxies", "nebulae", "other")
 EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 

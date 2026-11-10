@@ -4,8 +4,10 @@ import streamlit as st
 import torch
 import torch.nn as nn
 from torchvision import models
-from PIL import Image
+from PIL import Image, ImageOps
 from model_utils import build_eval_transform
+from explainability import make_gradcam
+from inference_utils import predict_many, predict_image
 import pandas as pd
 import plotly.express as px
 
@@ -14,7 +16,7 @@ MODEL_PATH = ROOT / "models" / "astrovision_model.pth"
 PROGRESS_PATH = ROOT / "training_progress.json"
 LOG_PATH = ROOT / "training_log.txt"
 STOP_FLAG = ROOT / "stop_training.flag"
-DISPLAY = {"galaxies": "Галактика", "nebulae": "Туманность"}
+DISPLAY = {"galaxies": "Галактика", "nebulae": "Туманность", "other": "Не подходит"}
 
 st.set_page_config(page_title="AstroVision AI", page_icon="🌌", layout="wide")
 st.markdown("""
@@ -87,58 +89,107 @@ def split_counts(split):
     return out
 
 
-st.markdown('<div class="hero"><h1>🌌 AstroVision AI</h1><p class="muted">Исследовательская система классификации астрофотографий · Галактики и туманности · v0.5</p></div>', unsafe_allow_html=True)
+st.markdown('<div class="hero"><h1>🌌 AstroVision AI</h1><p class="muted">Исследовательская система классификации астрофотографий · Только галактики и туманности · open-set фильтрация · v1.0</p></div>', unsafe_allow_html=True)
 st.write("")
-page = st.sidebar.radio("Навигация", ["Анализ снимка", "Обучение модели", "Научная статистика", "О проекте"])
-st.sidebar.caption("Исследовательский прототип • версия 0.5")
+page = st.sidebar.radio("Навигация", ["Анализ снимка", "Пакетный анализ", "Обучение модели", "Научная статистика", "О проекте"])
+st.sidebar.caption("Исследовательский прототип • версия 1.0")
 
 # =====================================================================
 if page == "Анализ снимка":
     st.subheader("Анализ астрофотографии")
-    st.write("Загрузите астрофотографию. Модель сравнит её с двумя изученными классами: галактики и туманности.")
+    st.write("Загрузите изображение. Система принимает только галактики и туманности. Любые другие объекты должны отклоняться.")
     tta = st.checkbox("TTA: усреднение вероятностей с отражённым снимком (медленнее)", value=False)
+    show_gradcam = st.checkbox("Показать Grad-CAM (визуальное объяснение модели)", value=False)
     uploaded = st.file_uploader("Выберите астрофотографию", type=["jpg", "jpeg", "png"])
     if not MODEL_PATH.exists():
         st.info("Модель ещё не обучена. Загрузите датасет и запустите обучение на странице «Обучение модели» или выполните:")
         st.code("python train.py --data_dir dataset --epochs 8")
     elif uploaded:
-        image = Image.open(uploaded).convert("RGB")
+        if uploaded.size > 20 * 1024 * 1024:
+            st.error("Файл больше 20 МБ. Уменьшите изображение и попробуйте снова.")
+            st.stop()
+        image = ImageOps.exif_transpose(Image.open(uploaded)).convert("RGB")
         left, right = st.columns([1, 1])
         with left:
             st.image(image, caption="Загруженное изображение", use_container_width=True)
         try:
             model, classes, threshold, metrics, history, img_size = load_model(str(MODEL_PATH), MODEL_PATH.stat().st_mtime)
-            x = image_transform(img_size)(image).unsqueeze(0)
-            t0 = time.perf_counter()
-            with torch.no_grad():
-                if tta:
-                    x2 = torch.flip(x, dims=[3])
-                    probs = (torch.softmax(model(x), dim=1) + torch.softmax(model(x2), dim=1))[0] / 2
-                else:
-                    probs = torch.softmax(model(x), dim=1)[0]
-            infer_ms = (time.perf_counter() - t0) * 1000
-            values = probs.tolist()
-            idx = int(torch.argmax(probs))
-            confidence = values[idx]
+            result = predict_image(model, image, classes, img_size, threshold, tta)
+            values = [result.probabilities[c] for c in classes]
+            idx = classes.index(result.predicted_class)
+            confidence = result.confidence
             with right:
-                if confidence < threshold:
-                    st.warning("Низкая уверенность: результат требует ручной проверки. Это не полноценное обнаружение неизвестных классов.")
+                if result.status == "not_supported":
+                    st.error("ОШИБКА: изображение не относится к двум поддерживаемым категориям — галактикам или туманностям. Загрузите подходящую астрофотографию.")
+                    st.caption(result.rejection_reason)
                 else:
-                    st.success(f"Предсказание: **{DISPLAY.get(classes[idx], classes[idx])}**")
-                st.metric("Уверенность модели", f"{confidence*100:.1f}%")
-                st.caption(f"⏱ Время инференса: {infer_ms:.0f} мс (CPU)")
-                chart = pd.DataFrame({"Класс": [DISPLAY.get(c, c) for c in classes], "Вероятность": [v*100 for v in values]})
-                fig = px.bar(chart, x="Класс", y="Вероятность", range_y=[0, 100], text_auto=".1f",
-                             color="Класс", title="Распределение вероятностей")
+                    st.success(f"Объект распознан: **{DISPLAY.get(classes[idx], classes[idx])}**")
+                st.metric("Оценка модели", f"{confidence*100:.1f}%")
+                st.caption(f"⏱ Время анализа: {result.inference_ms:.0f} мс")
+                chart = pd.DataFrame({"Класс": [DISPLAY.get(c, c) for c in classes], "Оценка": [v*100 for v in values]})
+                fig = px.bar(chart, x="Класс", y="Оценка", range_y=[0, 100], text_auto=".1f",
+                             color="Класс", title="Распределение оценок модели")
                 fig.update_layout(template="plotly_dark", showlegend=False, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
                 st.plotly_chart(fig, use_container_width=True)
-                st.caption("Вероятность — оценка модели, а не подтверждённая вероятность истинности. Результат зависит от состава обучающих данных.")
+                st.caption("Оценки softmax не являются вероятностями истинности. Отказ зависит от качества и разнообразия обучающего класса other.")
+            if show_gradcam:
+                with st.spinner("Строю карту Grad-CAM..."):
+                    overlay, cam_class, cam_score = make_gradcam(
+                        model, image, image_transform(img_size), class_index=idx
+                    )
+                with left:
+                    st.image(
+                        overlay,
+                        caption=("Grad-CAM: области, повлиявшие на выбранный класс "
+                                 f"({DISPLAY.get(classes[cam_class], classes[cam_class])}, оценка {cam_score:.3f})"),
+                        use_container_width=True,
+                    )
+                    st.caption("Тепловая карта является диагностической визуализацией, а не доказательством физически значимых признаков.")
         except Exception as e:
             st.error(f"Не удалось загрузить модель или обработать изображение: {e}")
 
 # =====================================================================
+elif page == "Пакетный анализ":
+    st.subheader("Пакетный анализ астрофотографий")
+    st.write("Загрузите несколько снимков для одинаковой обработки и выгрузки результатов в CSV.")
+    if not MODEL_PATH.exists():
+        st.info("Сначала обучите модель на странице «Обучение модели».")
+    else:
+        files = st.file_uploader("Изображения для анализа", type=["jpg", "jpeg", "png", "tif", "tiff", "webp"], accept_multiple_files=True)
+        tta_batch = st.checkbox("Использовать TTA для каждого снимка (медленнее)", value=False, key="batch_tta")
+        if files:
+            st.caption(f"Выбрано файлов: {len(files)}. Ограничение: 100 файлов и 20 МБ на файл.")
+            if len(files) > 100:
+                st.error("За один запуск можно обработать не более 100 изображений.")
+            elif any(f.size > 20 * 1024 * 1024 for f in files):
+                st.error("Один или несколько файлов превышают 20 МБ.")
+            elif st.button("Выполнить пакетную классификацию", type="primary"):
+                model, classes, threshold, _, _, img_size = load_model(str(MODEL_PATH), MODEL_PATH.stat().st_mtime)
+                from io import BytesIO
+                inputs = []
+                for uploaded_file in files:
+                    try:
+                        inputs.append((uploaded_file.name, Image.open(BytesIO(uploaded_file.getvalue())).copy()))
+                    except Exception:
+                        # Повреждённый файл попадёт в общий отчёт как отдельная ошибка.
+                        inputs.append((uploaded_file.name, None))
+                results = predict_many(model, inputs, classes, img_size, threshold, tta_batch)
+                frame = pd.DataFrame(results)
+                st.dataframe(frame, use_container_width=True, hide_index=True)
+                ok_count = int((frame["status"] != "error").sum())
+                low_count = int((frame["status"] == "not_supported").sum())
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Обработано", f"{ok_count}/{len(frame)}")
+                c2.metric("Отклонено", low_count)
+                c3.metric("Ошибки файлов", int((frame["status"] == "error").sum()))
+                st.download_button("Скачать результаты CSV", frame.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name="astrovision_batch_predictions.csv", mime="text/csv")
+                st.caption("Статус «not_supported» означает, что система отклонила снимок как неподходящий или недостаточно уверенно распознанный.")
+
+# =====================================================================
 elif page == "Обучение модели":
     st.subheader("Обучение модели")
+    st.info("Для строгого отказа от посторонних изображений обязателен третий обучающий класс dataset/*/other. Добавляйте туда разнообразные снимки звёзд, планет, Луны, пейзажей, людей, схем и обычных фотографий.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     proc = st.session_state.get("train_proc")
 
@@ -222,7 +273,7 @@ elif page == "Обучение модели":
             if device.type == "cuda":
                 st.success(f"🚀 GPU: {torch.cuda.get_device_name(0)} — обучение с AMP (float16)")
             else:
-                st.info("💻 CPU: обучение возможно, но медленное (AMP bfloat16 включён). Рекомендуется GPU.")
+                st.info("💻 CPU: обучение возможно, но может быть медленным. Mixed precision AMP отключён на CPU.")
             st.caption("Скорость обучения и инференса зависит от устройства, размера модели и batch size.")
 
         st.markdown("**Гиперпараметры**")
@@ -291,8 +342,8 @@ elif page == "Научная статистика":
         c0.metric("Скорость инференса", f"{ms:.0f} мс")
         c1.metric("Производительность", f"{1000/max(ms, 1e-6):.1f} изобр/с")
         c2.metric("Размер входа", f"{img_size}×{img_size}")
-        c3.metric("Устройство теста", "CPU")
-        st.caption("Бенчмарк: одиночные изображения на CPU. На GPU инференс обычно в разы быстрее.")
+        c3.metric("Устройство бенчмарка", "CPU")
+        st.caption("Бенчмарк выполняется на CPU, один снимок за раз; сравнивайте времена только при одинаковом оборудовании и настройках.")
         st.caption("Метрики рассчитаны скриптом обучения на папке test, если она была предоставлена.")
         if history:
             fig = px.line(pd.DataFrame(history).set_index("epoch")[["train_loss", "val_loss", "train_acc", "val_acc"]],
@@ -334,17 +385,17 @@ elif page == "Научная статистика":
                 st.dataframe(pd.DataFrame(pc).T, use_container_width=True)
         else:
             st.warning("Тестовые метрики отсутствуют. Проверьте структуру test/ и повторите обучение.")
-        st.caption(f"Порог предупреждения о низкой уверенности: {threshold:.2f}. Это эвристика, не OOD-детектор.")
+        st.caption(f"Порог отказа по низкой уверенности: {threshold:.2f}. Дополнительно используется обучаемый класс other; абсолютной гарантии отказа для неизвестных данных нет.")
 
 # =====================================================================
 else:
     st.subheader("О проекте")
     st.markdown("""
-**AstroVision AI v0.5** — учебно-исследовательский прототип компьютерного зрения для классификации астрофотографий на два класса: галактики и туманности.
+**AstroVision AI v1.0** — учебно-исследовательская система, которая принимает только галактики и туманности. Внутренний класс `other` нужен для отказа от всех неподходящих изображений.
 
-**Метод:** transfer learning на EfficientNet-B0 (ImageNet) с двухэтапным дообучением: сначала замороженный backbone и обучаемый классификатор, затем разморозка с малым learning rate.
+**Метод:** transfer learning на EfficientNet-B0 (ImageNet), три обучаемых класса (`galaxies`, `nebulae`, `other`) и отказ от низкоуверенных результатов. Двухэтапное дообучение: сначала замороженный backbone и обучаемый классификатор, затем разморозка с малым learning rate.
 
-**Воспроизводимость и оценка (v0.5):**
+**Воспроизводимость и оценка (v0.6):**
 - фиксируемый seed и одинаковые настройки для повторных запусков;
 - проверка точных дубликатов между train/val/test и группировки по object_id;
 - единая letterbox-предобработка без искажения пропорций для train/validation/test/inference;
@@ -353,9 +404,15 @@ else:
 - Accuracy, Balanced Accuracy, Precision, Recall, F1, ROC-AUC, MCC, Cohen’s kappa;
 - 95% bootstrap-интервалы и CSV с предсказаниями на каждом тестовом изображении.
 
+**Инструменты анализа:**
+- пакетная классификация до 100 снимков с CSV-отчётом и изоляцией ошибок отдельных файлов;
+- Grad-CAM для визуальной проверки областей изображения, влияющих на решение модели;
+- классический baseline на цветовых гистограммах, миниатюре яркости и логистической регрессии;
+- балансируемое групповое разбиение с поиском кандидата, близкого к 70/15/15.
+
 **Скорость:**
-- Mixed precision (AMP): float16 на GPU, bfloat16 на CPU;
-- `channels_last`, `pin_memory`, `non_blocking`, `cudnn.benchmark`;
+- Mixed precision (AMP, float16) на CUDA GPU; на CPU AMP отключён;
+- `channels_last`, `pin_memory`, `non_blocking`; `cudnn.benchmark` выключен ради воспроизводимости;
 - косинусное расписание learning rate с ненулевым шагом при размораживании backbone;
 - замер скорости обучения (изображений/с) и бенчмарк инференса;
 - опциональный TTA (test-time augmentation) — усреднение предсказаний с отражённым снимком.
@@ -366,7 +423,7 @@ else:
 - умеренные аугментации (повороты, отражения, кропы и небольшие цветовые сдвиги);
 - per-class метрики и история обучения в чекпоинте.
 
-**Ограничения:** модель не определяет название конкретного небесного объекта, координаты или физические свойства. Она классифицирует изображение только на два заданных класса. Значение softmax — оценка модели, а не гарантированная вероятность истинности. Низкая уверенность не является полноценным OOD-детектором. Доверительные интервалы не компенсируют маленький или нерепрезентативный test-набор.
+**Ограничения:** внутренний класс `other` и порог уверенности помогают отклонять неподходящие снимки, но не дают абсолютной гарантии для любого неизвестного изображения. Качество отказа зависит от разнообразия класса `other`; необходим отдельный OOD-тест. Softmax — оценка модели, а не вероятность истинности.
 
 **Технологии:** Python, PyTorch, torchvision, Streamlit, Plotly, scikit-learn.
 

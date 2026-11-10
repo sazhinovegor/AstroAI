@@ -14,9 +14,131 @@ from pathlib import Path
 
 from sklearn.model_selection import StratifiedGroupKFold
 
-CLASSES = ("galaxies", "nebulae")
+CLASSES = ("galaxies", "nebulae", "other")
 SPLITS = ("train", "val", "test")
 EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+def choose_grouped_split(
+    labels: list[str], groups: list[str], seed: int = 42, attempts: int = 20
+) -> tuple[dict[str, list[int]], dict[str, object]]:
+    """Подбирает наиболее сбалансированное групповое разбиение 70/15/15.
+
+    Перебирает допустимые фолды StratifiedGroupKFold с разными seed и выбирает
+    вариант с минимальным отклонением долей изображений и каждого класса.
+    Один object_id никогда не разделяется между выборками.
+    """
+    if len(labels) != len(groups) or not labels:
+        raise ValueError("labels и groups должны иметь одинаковую ненулевую длину")
+    if set(labels) != set(CLASSES):
+        raise ValueError(f"В данных должны присутствовать классы {CLASSES}")
+
+    group_classes: dict[str, set[str]] = defaultdict(set)
+    for label, group in zip(labels, groups):
+        group_classes[str(group)].add(label)
+    mixed = {group: sorted(values) for group, values in group_classes.items() if len(values) != 1}
+    if mixed:
+        raise ValueError(f"object_id встречаются в нескольких классах: {list(mixed.items())[:10]}")
+
+    groups_per_class = {
+        name: len({g for label, g in zip(labels, groups) if label == name})
+        for name in CLASSES
+    }
+    if any(count < 7 for count in groups_per_class.values()):
+        raise ValueError(
+            "Для группового разбиения с 7 фолдами требуется не менее 7 разных object_id на класс; "
+            f"сейчас: {groups_per_class}"
+        )
+
+    target = {"train": 0.70, "val": 0.15, "test": 0.15}
+    label_array = list(labels)
+    group_array = list(groups)
+    all_indices = list(range(len(labels)))
+    total = len(labels)
+    class_totals = {name: sum(label == name for label in labels) for name in CLASSES}
+
+    def score_split(assigned: dict[str, list[int]]) -> float:
+        score = 0.0
+        for split, indices in assigned.items():
+            ratio = len(indices) / total
+            score += 2.0 * (ratio - target[split]) ** 2
+            present = {label_array[i] for i in indices}
+            if present != set(CLASSES):
+                return float("inf")
+            for class_name in CLASSES:
+                class_ratio = sum(label_array[i] == class_name for i in indices) / class_totals[class_name]
+                score += 3.0 * (class_ratio - target[split]) ** 2
+        return score
+
+    best: dict[str, list[int]] | None = None
+    best_score = float("inf")
+    best_seed = None
+
+    for attempt in range(max(1, attempts)):
+        outer = StratifiedGroupKFold(
+            n_splits=7, shuffle=True, random_state=int(seed + attempt)
+        )
+        try:
+            outer_folds = list(outer.split(all_indices, label_array, group_array))
+        except ValueError:
+            continue
+        for outer_no, (train_val_idx, test_idx) in enumerate(outer_folds):
+            train_val_labels = [label_array[i] for i in train_val_idx]
+            train_val_groups = [group_array[i] for i in train_val_idx]
+            inner = StratifiedGroupKFold(
+                n_splits=6, shuffle=True,
+                random_state=int(seed + 1000 + attempt * 7 + outer_no),
+            )
+            try:
+                inner_folds = list(inner.split(
+                    list(range(len(train_val_idx))), train_val_labels, train_val_groups
+                ))
+            except ValueError:
+                continue
+            for train_rel_idx, val_rel_idx in inner_folds:
+                train_idx = [train_val_idx[i] for i in train_rel_idx]
+                val_idx = [train_val_idx[i] for i in val_rel_idx]
+                assigned = {"train": train_idx, "val": val_idx, "test": list(test_idx)}
+                current_score = score_split(assigned)
+                if current_score < best_score:
+                    best, best_score = assigned, current_score
+                    best_seed = {
+                        "outer_random_state": int(seed + attempt),
+                        "inner_random_state": int(seed + 1000 + attempt * 7 + outer_no),
+                        "outer_fold": outer_no,
+                    }
+
+    if best is None:
+        raise ValueError(
+            "Не удалось построить разбиение, где оба класса присутствуют в train/val/test. "
+            "Увеличьте число независимых object_id для каждого класса."
+        )
+
+    # Финальная инвариантная проверка: object_id не пересекаются.
+    object_sets = {
+        split: {group_array[i] for i in indices}
+        for split, indices in best.items()
+    }
+    if (object_sets["train"] & object_sets["val"] or
+            object_sets["train"] & object_sets["test"] or
+            object_sets["val"] & object_sets["test"]):
+        raise RuntimeError("Внутренняя ошибка: обнаружено пересечение object_id")
+
+    details = {
+        "seed": int(seed),
+        "selection_score": float(best_score),
+        "selected_candidate": best_seed,
+        "target_ratios": target,
+        "image_ratios": {split: len(indices) / total for split, indices in best.items()},
+        "class_image_ratios": {
+            split: {
+                class_name: sum(label_array[i] == class_name for i in indices) / class_totals[class_name]
+                for class_name in CLASSES
+            }
+            for split, indices in best.items()
+        },
+    }
+    return best, details
 
 
 def main() -> None:
@@ -25,6 +147,8 @@ def main() -> None:
     parser.add_argument("--raw_dir", default="raw")
     parser.add_argument("--metadata", default="raw_metadata.csv")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--attempts", type=int, default=20,
+                        help="Число random seed для поиска сбалансированного группового разбиения")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -78,15 +202,13 @@ def main() -> None:
     if multi_class_objects:
         raise SystemExit(f"Один object_id отнесён к разным классам: {list(multi_class_objects.items())[:10]}")
 
-    groups_per_class = {
-        class_name: len({r["object_id"] for r in records if r["class"] == class_name})
-        for class_name in CLASSES
-    }
-    if any(count < 7 for count in groups_per_class.values()):
-        raise SystemExit(
-            "Для группового разбиения примерно 70/15/15 желательно не менее 7 разных object_id "
-            f"на класс. Сейчас: {groups_per_class}. Не делите фотографии одного объекта между разделами."
+    try:
+        assigned, split_details = choose_grouped_split(
+            [r["class"] for r in records], [r["object_id"] for r in records],
+            seed=args.seed, attempts=args.attempts,
         )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     existing = [root / split for split in SPLITS if (root / split).exists()]
     if existing and not args.overwrite:
@@ -97,33 +219,10 @@ def main() -> None:
         for folder in existing:
             shutil.rmtree(folder)
 
-    labels = [r["class"] for r in records]
-    groups = [r["object_id"] for r in records]
-    indices = list(range(len(records)))
-
-    # Первая групповая стратификация: один из семи фолдов (около 14%) — test.
-    outer = StratifiedGroupKFold(n_splits=7, shuffle=True, random_state=args.seed)
-    train_val_idx, test_idx = next(outer.split(indices, labels, groups))
-
-    # В оставшейся части выделяем около 1/6 под validation (~14% всего набора).
-    tv_labels = [labels[i] for i in train_val_idx]
-    tv_groups = [groups[i] for i in train_val_idx]
-    inner = StratifiedGroupKFold(n_splits=6, shuffle=True, random_state=args.seed + 1)
-    train_rel_idx, val_rel_idx = next(inner.split(train_val_idx, tv_labels, tv_groups))
-    train_idx = [train_val_idx[i] for i in train_rel_idx]
-    val_idx = [train_val_idx[i] for i in val_rel_idx]
-
-    assigned = {"train": train_idx, "val": val_idx, "test": list(test_idx)}
-    for split, split_indices in assigned.items():
-        split_classes = {labels[i] for i in split_indices}
-        if split_classes != set(CLASSES):
-            raise SystemExit(
-                f"StratifiedGroupKFold не распределил оба класса в {split}: {split_classes}. "
-                "Нужно больше разных астрономических объектов каждого класса."
-            )
-
     output_metadata = []
-    summary = {"seed": args.seed, "split_counts": {}, "object_counts": {}, "ratios": {}}
+    summary: dict[str, object] = {
+        **split_details, "split_counts": {}, "object_counts": {}, "ratios": {}
+    }
     for split, split_indices in assigned.items():
         class_counts = Counter()
         split_objects = defaultdict(set)
@@ -155,9 +254,13 @@ def main() -> None:
     report_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     missing_provenance = sum(1 for row in output_metadata if not row["source"] or not row["license"])
-    print("=== ГОТОВО: РАЗБИЕНИЕ ПО АСТРОНОМИЧЕСКИМ ОБЪЕКТАМ ===")
+    print("=== ГОТОВО: СБАЛАНСИРОВАННОЕ РАЗБИЕНИЕ ПО АСТРОНОМИЧЕСКИМ ОБЪЕКТАМ ===")
     for split in SPLITS:
-        print(f"{split}: {summary['split_counts'][split]}, доля={summary['ratios'][split]:.1%}, object_id={summary['object_counts'][split]}")
+        print(
+            f"{split}: {summary['split_counts'][split]}, доля={summary['ratios'][split]:.1%}, "
+            f"object_id={summary['object_counts'][split]}"
+        )
+    print(f"Критерий баланса: {summary['selection_score']:.6f}")
     print(f"metadata.csv: {out_meta}")
     print(f"Отчёт разбиения: {report_path}")
     if missing_provenance:

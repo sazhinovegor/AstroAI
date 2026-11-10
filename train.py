@@ -1,4 +1,4 @@
-"""AstroVision AI v0.5 — воспроизводимое обучение классификатора астрофотографий.
+"""AstroVision AI v0.6 — воспроизводимое обучение классификатора астрофотографий.
 
 Классы: galaxies и nebulae. Модель: EfficientNet-B0 + transfer learning.
 Важные принципы: фиксированный seed, контроль утечек данных, best checkpoint
@@ -38,7 +38,7 @@ from torchvision import datasets, models, transforms
 
 from model_utils import SquarePadResize, build_eval_transform, MEAN, STD
 
-EXPECTED_CLASSES = ["galaxies", "nebulae"]
+EXPECTED_CLASSES = ["galaxies", "nebulae", "other"]
 
 
 def set_reproducibility(seed: int) -> None:
@@ -68,9 +68,12 @@ def build_transforms(img_size: int = 224, augment: bool = True):
         train_ops += [
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
-            transforms.RandomRotation(20, fill=(0, 0, 0)),
-            transforms.RandomResizedCrop(img_size, scale=(0.88, 1.0)),
-            transforms.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.06),
+            # Полный диапазон поворота допустим для астрономических кадров,
+            # где ориентация в поле зрения обычно не является меткой класса.
+            transforms.RandomRotation(180, fill=(0, 0, 0)),
+            # Не используем RandomResizedCrop: он может обрезать протяжённую
+            # структуру галактики/туманности и создать искусственный признак.
+            transforms.ColorJitter(brightness=0.08, contrast=0.08, saturation=0.04),
         ]
     train_ops += [transforms.ToTensor(), transforms.Normalize(MEAN, STD)]
     return transforms.Compose(train_ops), build_eval_transform(img_size)
@@ -94,9 +97,10 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def check_split_leakage(split_dirs: dict[str, Path]) -> None:
-    """Останавливает обучение при идентичных файлах между разными разделами."""
+def check_split_leakage(split_dirs: dict[str, Path]) -> dict[str, str]:
+    """Проверяет точные дубликаты и возвращает SHA-256 манифест датасета."""
     seen: dict[str, tuple[str, Path]] = {}
+    manifest: dict[str, str] = {}
     duplicates = []
     for split, folder in split_dirs.items():
         if not folder.exists():
@@ -108,6 +112,8 @@ def check_split_leakage(split_dirs: dict[str, Path]) -> None:
                 digest = sha256_file(file)
             except OSError as exc:
                 raise SystemExit(f"Не удалось прочитать файл {file}: {exc}")
+            rel = file.relative_to(folder.parent).as_posix()
+            manifest[rel] = digest
             if digest in seen and seen[digest][0] != split:
                 old_split, old_path = seen[digest]
                 duplicates.append((old_split, str(old_path), split, str(file)))
@@ -121,6 +127,7 @@ def check_split_leakage(split_dirs: dict[str, Path]) -> None:
             "Обнаружены одинаковые файлы между train/val/test. Это может завысить "
             "качество на тесте. Удалите дубликаты или исправьте разделение:\n" + details
         )
+    return manifest
 
 
 def check_metadata_integrity(root: Path, required: bool = False,
@@ -231,18 +238,20 @@ def run_epoch(model, loader, criterion, device, optimizer=None, scaler=None,
             torch.autocast(device_type="cuda", dtype=torch.float16)
             if use_amp else nullcontext()
         )
-        with amp_context:
-            logits = model(x)
-            loss = criterion(logits, y)
-        if training:
-            optimizer.zero_grad(set_to_none=True)
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                optimizer.step()
+        # Не строим autograd-граф на validation/test: это снижает расход памяти.
+        with torch.set_grad_enabled(training):
+            with amp_context:
+                logits = model(x)
+                loss = criterion(logits, y)
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
         total_loss += loss.item() * x.size(0)
         correct += (logits.argmax(1) == y).sum().item()
         total += y.size(0)
@@ -339,7 +348,7 @@ def evaluate_test(model, loader, classes, device, use_amp, out_prefix: Path, see
                   sample_object_ids: list[str] | None = None):
     model.eval()
     ys, preds, probs_all = [], [], []
-    with torch.no_grad():
+    with torch.inference_mode():
         for x, y in loader:
             x = x.to(device, non_blocking=device.type == "cuda")
             amp_context = (
@@ -408,7 +417,7 @@ def evaluate_test(model, loader, classes, device, use_amp, out_prefix: Path, see
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AstroVision AI v0.5 research training")
+    parser = argparse.ArgumentParser(description="AstroVision AI v0.6 research training")
     parser.add_argument("--data_dir", default="dataset")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -439,6 +448,10 @@ def main():
 
     if args.epochs < 1 or args.batch_size < 1 or args.img_size < 32:
         raise SystemExit("epochs, batch_size должны быть положительными, img_size >= 32")
+    if args.lr <= 0 or args.workers < 0 or args.patience < 0:
+        raise SystemExit("lr должен быть > 0; workers и patience должны быть >= 0")
+    if not 0.0 <= args.threshold <= 1.0:
+        raise SystemExit("threshold должен находиться в диапазоне [0, 1]")
     if not 0 <= args.freeze_epochs <= args.epochs:
         raise SystemExit("freeze_epochs должен быть от 0 до epochs")
 
@@ -451,7 +464,9 @@ def main():
     if not split_dirs["test"].exists() and not args.allow_missing_test:
         raise SystemExit("Для исследовательского запуска обязательна папка dataset/test. "
                          "--allow_missing_test допускается только для проверки кода.")
-    check_split_leakage(split_dirs)
+    dataset_manifest = check_split_leakage(split_dirs)
+    manifest_payload = "\n".join(f"{path},{digest}" for path, digest in sorted(dataset_manifest.items()))
+    dataset_manifest_sha256 = hashlib.sha256(manifest_payload.encode("utf-8")).hexdigest()
     for warning in check_metadata_integrity(
         root, required=args.require_metadata, require_provenance=args.require_provenance
     ):
@@ -461,7 +476,7 @@ def main():
     train_ds = datasets.ImageFolder(split_dirs["train"], transform=train_tf)
     val_ds = datasets.ImageFolder(split_dirs["val"], transform=eval_tf)
     if train_ds.classes != EXPECTED_CLASSES:
-        raise SystemExit(f"Ожидаются два класса {EXPECTED_CLASSES}; найдены {train_ds.classes}")
+        raise SystemExit(f"Ожидаются три класса {EXPECTED_CLASSES}; найдены {train_ds.classes}")
     if val_ds.classes != train_ds.classes:
         raise SystemExit(f"Классы train {train_ds.classes} не совпадают с val {val_ds.classes}")
     if not train_ds.samples or not val_ds.samples:
@@ -629,6 +644,21 @@ def main():
             "train": len(train_ds), "val": len(val_ds),
             "test": len(test_ds) if test_ds else 0,
         },
+        "class_counts": {
+            "train": {name: int(sum(1 for target in train_ds.targets if target == index))
+                      for index, name in enumerate(train_ds.classes)},
+            "val": {name: int(sum(1 for target in val_ds.targets if target == index))
+                    for index, name in enumerate(val_ds.classes)},
+            "test": ({name: int(sum(1 for target in test_ds.targets if target == index))
+                      for index, name in enumerate(test_ds.classes)} if test_ds else {}),
+        },
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "metadata_sha256": sha256_file(root / "metadata.csv") if (root / "metadata.csv").is_file() else None,
+        "determinism": {
+            "python_numpy_torch_seed": args.seed,
+            "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+            "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        },
         "classes": train_ds.classes,
         "architecture": "EfficientNet-B0",
         "pretrained_imagenet": not args.from_scratch,
@@ -642,6 +672,7 @@ def main():
     torch.save({
         "model_state": {k: v.detach().cpu() for k, v in model.state_dict().items()},
         "classes": train_ds.classes,
+        "class_to_idx": train_ds.class_to_idx,
         "threshold": args.threshold,
         "metrics": metrics,
         "history": history,

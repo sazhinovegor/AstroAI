@@ -70,7 +70,7 @@ def main():
 
     cm = metrics.get("confusion_matrix")
     if cm:
-        lines += ["", "### Матрица ошибок", "", "Порядок классов: " + ", ".join(experiment.get("classes", ["galaxies", "nebulae"])), "", "```text", "\n".join(" ".join(map(str, row)) for row in cm), "```"]
+        lines += ["", "### Матрица ошибок", "", "Порядок классов: " + ", ".join(experiment.get("classes", ["galaxies", "nebulae", "other"])), "", "```text", "\n".join(" ".join(map(str, row)) for row in cm), "```"]
 
     if audit:
         lines += ["", "## 3. Аудит датасета", "", f"- Проверка пройдена: {audit.get('passed', False)}", f"- Ошибок: {len(audit.get('errors', []))}; предупреждений: {len(audit.get('warnings', []))}",
